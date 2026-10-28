@@ -1,0 +1,26 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno y secretos
+.env
+.env*.local
+
+# Sesión de autenticación de WhatsApp (Baileys) - NUNCA SUBIR
+auth_info_baileys/
+
+# Estado en caliente con números e invitaciones
+data/bot_state.json
+
+# Archivos de empaquetado y logs
+*.zip
+*.tar
+*.gz
+*.log
+npm-debug.log*
+scratch/
+
+# Sistema operativo y editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

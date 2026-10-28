@@ -1,0 +1,47 @@
+{
+  "nextId": 7,
+  "items": [
+    {
+      "code": "A1",
+      "cid": "cid_real_1",
+      "filename": "A1.webp",
+      "title": "Sticker A1",
+      "createdAt": "2026-10-28T21:13:46.646Z"
+    },
+    {
+      "code": "A2",
+      "cid": "cid_real_2",
+      "filename": "A2.webp",
+      "title": "Sticker A2",
+      "createdAt": "2026-10-28T21:13:46.649Z"
+    },
+    {
+      "code": "A3",
+      "cid": "cid_real_3",
+      "filename": "A3.webp",
+      "title": "Sticker A3",
+      "createdAt": "2026-10-28T21:13:46.651Z"
+    },
+    {
+      "code": "A4",
+      "cid": "cid_real_4",
+      "filename": "A4.webp",
+      "title": "Sticker A4",
+      "createdAt": "2026-10-28T21:13:46.652Z"
+    },
+    {
+      "code": "A5",
+      "cid": "cid_real_5",
+      "filename": "A5.webp",
+      "title": "Sticker A5",
+      "createdAt": "2026-10-28T21:13:46.654Z"
+    },
+    {
+      "code": "A6",
+      "cid": "cid_real_6",
+      "filename": "A6.webp",
+      "title": "Sticker A6",
+      "createdAt": "2026-10-28T21:13:46.655Z"
+    }
+  ]
+}
