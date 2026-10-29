@@ -163,9 +163,8 @@ async function handleTikTokMessage(sock, msg, rawUrl, remoteJid) {
       const resetText = error.resetText || 'el próximo ciclo mensual';
       replyMessage =
         `⚠️ *Stoky: Cuota agotada.*\n\n` +
-        `Se ha alcanzado el límite de cuota (por minuto o mensual) de la API de comentarios de TikTok.\n` +
-        `⏳ *Renovación estimada:* ${resetText}.\n\n` +
-        `_Escribe *stoky-quota* para consultar los detalles de la cuota._`;
+        `Se ha alcanzado el límite de cuota de la API de comentarios de TikTok.\n` +
+        `⏳ *Renovación estimada:* ${resetText}.`;
     } else if (error.message.includes('NO_CID')) {
       replyMessage = '⚠️ *Stoky:* El enlace corresponde al video completo, pero no a un comentario específico.\n\n👉 Para obtener el sticker: ve al comentario en TikTok, manténlo pulsado (o toca Compartir) y selecciona *"Copiar enlace"*.';
     } else if (error.message.includes('RAPIDAPI_KEY_MISSING')) {
