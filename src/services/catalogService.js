@@ -1,9 +1,61 @@
 import fs from 'fs';
 import path from 'path';
+import axios from 'axios';
 
 const DATA_DIR = path.resolve('data');
 const CACHE_DIR = path.join(DATA_DIR, 'stickers_cache');
 const CATALOG_INDEX = path.join(DATA_DIR, 'catalog.json');
+
+// Sincronización asíncrona con la base de datos y CDN de Supabase
+async function syncToSupabase(code, buffer, cid, title) {
+  const supabaseUrl = process.env.SUPABASE_URL || 'https://mpltesmsnwsxfkdmybbm.supabase.co';
+  const supabaseKey = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1wbHRlc21zbndzeGZrZG15YmJtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ4Mjk4MjksImV4cCI6MjA4MDQwNTgyOX0.e-tCPjGGviHKVXCxyfdS04gqmCMX67N1PVkQ6hfskOM';
+
+  if (!supabaseUrl || !supabaseKey) return;
+
+  try {
+    const filename = `${code}.webp`;
+    // 1. Subir el WebP a Supabase Storage (bucket público stoky-stickers)
+    const storageUrl = `${supabaseUrl}/storage/v1/object/stoky-stickers/${filename}`;
+    await axios.post(storageUrl, buffer, {
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        'Content-Type': 'image/webp',
+        'x-upsert': 'true'
+      },
+      timeout: 15000
+    });
+
+    const publicUrl = `${supabaseUrl}/storage/v1/object/public/stoky-stickers/${filename}`;
+
+    // 2. Insertar en la tabla stoky_stickers
+    const restUrl = `${supabaseUrl}/rest/v1/stoky_stickers`;
+    await axios.post(
+      restUrl,
+      {
+        code,
+        title: title || `Sticker ${code}`,
+        preview_url: publicUrl,
+        cid: String(cid || '')
+      },
+      {
+        headers: {
+          apikey: supabaseKey,
+          Authorization: `Bearer ${supabaseKey}`,
+          'Content-Type': 'application/json',
+          Prefer: 'resolution=merge-duplicates'
+        },
+        timeout: 10000
+      }
+    );
+
+    console.log(`[SupabaseSync] 🚀 Sticker ${code} sincronizado en vivo con Supabase y la web.`);
+  } catch (err) {
+    const errMsg = err.response?.data?.message || err.message;
+    console.warn(`[SupabaseSync] Aviso: No se pudo sincronizar ${code} con Supabase (${errMsg})`);
+  }
+}
 
 class CatalogService {
   constructor() {
@@ -110,6 +162,9 @@ class CatalogService {
       this.catalog.items.push(newItem);
       this.catalog.nextId++;
       this.saveCatalog();
+
+      // Sincronizar en segundo plano con la base de datos de Supabase
+      syncToSupabase(code, buffer, cid, title).catch(() => {});
 
       return {
         ...newItem,
