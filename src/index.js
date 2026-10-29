@@ -212,9 +212,10 @@ async function startBot() {
   logger.info({ version: version.join('.'), isLatest }, 'Iniciando WhatsApp Socket con Baileys');
 
   // 3. Crear socket con protecciones y emulación estándar de navegador Desktop
+  // Usamos level: 'silent' para silenciar logs internos de Baileys (fallos de MAC/descifrado de grupos antiguos)
   const sock = makeWASocket({
     version,
-    logger: pino({ level: LOG_LEVEL === 'silent' ? 'silent' : 'warn' }),
+    logger: pino({ level: 'silent' }),
     auth: state,
     browser: Browsers.macOS('Desktop'),
     printQRInTerminal: false,
@@ -225,50 +226,29 @@ async function startBot() {
   // Escuchar actualización de credenciales para persistir la sesión
   sock.ev.on('creds.update', saveCreds);
 
-  // Soporte para vinculación mediante Código de Emparejamiento (Pairing Code)
-  let usePairing = Boolean(process.env.PAIRING_NUMBER || process.argv.includes('--pairing'));
-  let pairingNumber = (process.env.PAIRING_NUMBER || '').trim().replace(/[^0-9]/g, '');
+  // Soporte para vinculación mediante Código de Emparejamiento (si se define PAIRING_NUMBER o --pairing)
+  const usePairing = Boolean(process.env.PAIRING_NUMBER || process.argv.includes('--pairing'));
+  const pairingNumber = (process.env.PAIRING_NUMBER || '').trim().replace(/[^0-9]/g, '');
 
-  if (!sock.authState.creds.registered) {
-    if (!pairingNumber && process.stdin.isTTY) {
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const question = (query) => new Promise((resolve) => rl.question(query, resolve));
-
-      console.log('\n======================================================');
-      console.log('📱 ¿CÓMO DESEAS VINCULAR EL BOT A WHATSAPP?');
-      console.log('1. Código de Emparejamiento de 8 dígitos (Recomendado para Celular / Termux)');
-      console.log('2. Código QR en pantalla');
-      console.log('======================================================');
-      const answer = await question('👉 Escribe tu número con código de país (ej: 573115040555) o presiona ENTER para QR: ');
-      rl.close();
-
-      const cleaned = answer.trim().replace(/[^0-9]/g, '');
-      if (cleaned.length >= 8) {
-        pairingNumber = cleaned;
-        usePairing = true;
+  if (!sock.authState.creds.registered && usePairing && pairingNumber) {
+    setTimeout(async () => {
+      try {
+        const code = await sock.requestPairingCode(pairingNumber);
+        const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+        console.log('\n╔══════════════════════════════════════════════════════════╗');
+        console.log(`║  🔑 CÓDIGO DE VINCULACIÓN:  ${formattedCode.padEnd(27)} ║`);
+        console.log('╠══════════════════════════════════════════════════════════╣');
+        console.log('║  Pasos en WhatsApp:                                     ║');
+        console.log('║  1. Abre WhatsApp en tu celular                          ║');
+        console.log('║  2. Toca Ajustes (o ⋮) > Dispositivos vinculados         ║');
+        console.log('║  3. Toca "Vincular un dispositivo"                       ║');
+        console.log('║  4. Toca abajo: "Vincular con el número de teléfono"     ║');
+        console.log(`║  5. Ingresa el código: ${formattedCode.padEnd(31)} ║`);
+        console.log('╚══════════════════════════════════════════════════════════╝\n');
+      } catch (err) {
+        console.error('❌ Error al generar código de emparejamiento:', err.message);
       }
-    }
-
-    if (usePairing && pairingNumber) {
-      setTimeout(async () => {
-        try {
-          const code = await sock.requestPairingCode(pairingNumber);
-          const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
-          console.log('\n╔══════════════════════════════════════════════════════════╗');
-          console.log(`║  🔑 CÓDIGO DE VINCULACIÓN:  ${formattedCode.padEnd(27)} ║`);
-          console.log('╠══════════════════════════════════════════════════════════╣');
-          console.log('║  Pasos en WhatsApp:                                     ║');
-          console.log('║  1. Abre WhatsApp en tu celular                          ║');
-          console.log('║  2. Toca Ajustes (o ⋮) > Dispositivos vinculados         ║');
-          console.log('║  3. Toca "Vincular un dispositivo"                       ║');
-          console.log('║  4. Toca abajo: "Vincular con el número de teléfono"     ║');
-          console.log(`║  5. Ingresa el código: ${formattedCode.padEnd(31)} ║`);
-          console.log('╚══════════════════════════════════════════════════════════╝\n');
-        } catch (err) {
-          console.error('❌ Error al generar código de emparejamiento:', err.message);
-        }
-      }, 3000);
-    }
+    }, 2500);
   }
 
   // Escuchar estado de conexión y código QR
@@ -277,8 +257,8 @@ async function startBot() {
 
     if (qr && !usePairing) {
       console.log('\n======================================================');
-      console.log('📱 ESCANEA EL CÓDIGO QR CON TU WHATSAPP (NÚMERO SECUNDARIO)');
-      console.log('WhatsApp > Dispositivos Vinculados > Vincular un dispositivo');
+      console.log('📱 ESCANEA ESTE CÓDIGO QR CON TU WHATSAPP');
+      console.log('WhatsApp > Dispositivos vinculados > Vincular un dispositivo');
       console.log('======================================================\n');
       qrcode.generate(qr, { small: true });
     }
