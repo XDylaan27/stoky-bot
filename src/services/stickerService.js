@@ -3,7 +3,6 @@ import path from 'path';
 import os from 'os';
 import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
-import sharp from 'sharp';
 import webpmux from 'node-webpmux';
 import { STICKER_PACK, STICKER_AUTHOR, STICKER_QUALITY } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -118,8 +117,7 @@ export async function injectExifToStaticWebp(webpBuffer, metadata = {}) {
 }
 
 /**
- * Convierte un video o GIF directamente a WebP animado de 512x512 con transparencia real y 15 FPS.
- * Elimina la conversión intermedia a GIF de 256 colores que corrompía los colores y producía artefactos.
+ * Convierte un video o GIF directamente a WebP animado de 512x512 con transparencia real y 15 FPS usando FFmpeg nativo.
  */
 export async function convertAnimatedToWebp(inputBuffer, ext = 'mp4', quality = 55) {
   const tmpDir = os.tmpdir();
@@ -171,16 +169,44 @@ export async function convertAnimatedToWebp(inputBuffer, ext = 'mp4', quality = 
 }
 
 /**
- * Convierte una imagen estática a WebP 512x512 con proporción respetada y fondo transparente.
+ * Convierte una imagen estática a WebP 512x512 con fondo transparente usando FFmpeg nativo (sin dependencias binarias externas como sharp).
  */
-export async function convertStaticToWebp(inputBuffer, quality = 75) {
-  return await sharp(inputBuffer)
-    .resize(512, 512, {
-      fit: 'contain',
-      background: { r: 0, g: 0, b: 0, alpha: 0 }
-    })
-    .webp({ quality })
-    .toBuffer();
+export async function convertStaticToWebp(inputBuffer, ext = 'png', quality = 75) {
+  const tmpDir = os.tmpdir();
+  const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const inputPath = path.join(tmpDir, `static_${id}.${ext}`);
+  const outputPath = path.join(tmpDir, `static_${id}.webp`);
+
+  fs.writeFileSync(inputPath, inputBuffer);
+
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-vframes', '1',
+        '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(512-iw)/2:(512-ih)/2:color=0x00000000',
+        '-vcodec', 'libwebp',
+        '-lossless', '0',
+        '-q:v', String(quality),
+        '-preset', 'default'
+      ])
+      .toFormat('webp')
+      .save(outputPath)
+      .on('end', () => {
+        try {
+          const res = fs.readFileSync(outputPath);
+          try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (_) {}
+          try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
+          resolve(res);
+        } catch (e) {
+          reject(e);
+        }
+      })
+      .on('error', (err) => {
+        try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (_) {}
+        try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
+        reject(err);
+      });
+  });
 }
 
 /**
@@ -209,6 +235,7 @@ export async function downloadMediaBuffer(url) {
 
 /**
  * Convierte cualquier recurso (video, gif, webp animado o foto) a un sticker WebP de WhatsApp perfecto (512x512).
+ * 100% compatible con Android Termux sin requerir sharp ni dependencias nativas complejas.
  * @param {string} mediaUrl 
  * @param {object} [customOptions] 
  * @returns {Promise<Buffer>} Buffer del sticker WebP final con EXIF y transparencia impecable
@@ -219,7 +246,7 @@ export async function createStickerFromUrl(mediaUrl, customOptions = {}) {
     const type = detectBufferType(buffer);
     const quality = customOptions.quality || STICKER_QUALITY || 55;
 
-    logger.info({ mediaUrl: mediaUrl.slice(0, 80), detectedType: type, size: buffer.length }, 'Procesando sticker con nuevo motor de alta fidelidad');
+    logger.info({ mediaUrl: mediaUrl.slice(0, 80), detectedType: type, size: buffer.length }, 'Procesando sticker con motor FFmpeg nativo');
 
     if (type === 'video' || type === 'gif') {
       const ext = type === 'gif' ? 'gif' : 'mp4';
@@ -233,8 +260,9 @@ export async function createStickerFromUrl(mediaUrl, customOptions = {}) {
       }
       return injectExifToAnimatedWebp(webp, customOptions);
     } else {
-      // Estático (PNG, JPG, WebP estático, SVG)
-      const webp = await convertStaticToWebp(buffer, 75);
+      // Estático (PNG, JPG, WebP estático)
+      const ext = type === 'image' ? (buffer[0] === 0xff ? 'jpg' : 'png') : 'webp';
+      const webp = await convertStaticToWebp(buffer, ext, 75);
       return await injectExifToStaticWebp(webp, customOptions);
     }
   } catch (error) {

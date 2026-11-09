@@ -1,5 +1,4 @@
 import dotenv from 'dotenv';
-import { StickerTypes } from 'wa-sticker-formatter';
 
 dotenv.config();
 
@@ -48,16 +47,7 @@ export const STICKER_PACK = process.env.STICKER_PACK || 'Stoky Stickers';
 export const STICKER_AUTHOR = process.env.STICKER_AUTHOR || 'Stoky Bot';
 export const STICKER_QUALITY = parseInt(process.env.STICKER_QUALITY, 10) || 75;
 
-// Mapeo de tipos de sticker para wa-sticker-formatter
-const typeMapping = {
-  full: StickerTypes.FULL,
-  cropped: StickerTypes.CROPPED,
-  circle: StickerTypes.CIRCLE,
-  rounded: StickerTypes.ROUNDED
-};
-
-const configuredType = (process.env.STICKER_TYPE || 'full').toLowerCase();
-export const STICKER_TYPE = typeMapping[configuredType] || StickerTypes.FULL;
+export const STICKER_TYPE = (process.env.STICKER_TYPE || 'full').toLowerCase();
 
 export const COOLDOWN_MS = (parseInt(process.env.COOLDOWN_SECONDS, 10) || 5) * 1000;
 
