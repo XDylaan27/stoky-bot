@@ -2,12 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import axios from 'axios';
-import { Sticker, StickerTypes } from 'wa-sticker-formatter';
 import ffmpeg from 'fluent-ffmpeg';
-import { STICKER_PACK, STICKER_AUTHOR, STICKER_TYPE, STICKER_QUALITY } from '../config.js';
+import sharp from 'sharp';
+import webpmux from 'node-webpmux';
+import { STICKER_PACK, STICKER_AUTHOR, STICKER_QUALITY } from '../config.js';
 import { logger } from '../utils/logger.js';
 
-// Configurar ruta del binario de FFmpeg (compatible con Windows, Linux y Android/Termux)
+// Configurar binario de FFmpeg según plataforma (Windows / Linux / Android Termux)
 (async () => {
   try {
     if (process.platform !== 'android') {
@@ -20,73 +21,166 @@ import { logger } from '../utils/logger.js';
       }
     }
   } catch (_) {
-    // Fallback a FFmpeg nativo
+    // Fallback a FFmpeg del PATH del sistema
   }
   logger.debug('Usando FFmpeg nativo del sistema (PATH)');
 })();
 
 /**
- * Detecta si un buffer corresponde a un archivo de video (MP4, WebM, AVI).
+ * Detecta el formato binario del archivo descargado.
  * @param {Buffer} buf 
- * @returns {boolean}
+ * @returns {'video' | 'gif' | 'webp_anim' | 'webp_static' | 'image' | 'unknown'}
  */
-function isVideoBuffer(buf) {
-  if (!buf || buf.length < 12) return false;
-  // MP4 (caja ftyp)
-  if (buf.toString('ascii', 4, 8) === 'ftyp') return true;
+export function detectBufferType(buf) {
+  if (!buf || buf.length < 12) return 'unknown';
+  // MP4 / MOV (caja ftyp)
+  if (buf.toString('ascii', 4, 8) === 'ftyp') return 'video';
   // WebM / Matroska (\x1A\x45\xDF\xA3)
-  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return true;
-  // AVI
-  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'AVI ') return true;
-  return false;
+  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return 'video';
+  // GIF (GIF87a / GIF89a)
+  if (buf.toString('ascii', 0, 3) === 'GIF') return 'gif';
+  // WebP (RIFF .... WEBP)
+  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') {
+    const isAnim = Boolean(buf.readUInt32LE(20) & 2);
+    return isAnim ? 'webp_anim' : 'webp_static';
+  }
+  // JPEG / PNG
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image';
+  if (buf[0] === 0x89 && buf.toString('ascii', 1, 4) === 'PNG') return 'image';
+  return 'unknown';
 }
 
 /**
- * Convierte un video directamente a WebP animado de 512x512 con transparencia real.
- * Evita la conversión intermedia a GIF de 256 colores que rompe los negros y genera
- * bloques blancos y ruido magenta en WhatsApp Web y navegadores basados en Chromium.
- * @param {Buffer} inputBuffer 
- * @param {number} quality 
- * @returns {Promise<Buffer>}
+ * Genera el payload binario EXIF requerido por WhatsApp para identificar el paquete de stickers.
  */
-async function convertVideoToWebp(inputBuffer, quality = 65) {
+function buildExifPayload(metadata = {}) {
+  const pack = metadata.pack || STICKER_PACK || 'Stoky Stickers';
+  const author = metadata.author || STICKER_AUTHOR || 'Stoky Bot';
+  const data = JSON.stringify({
+    'sticker-pack-id': 'stoky-bot',
+    'sticker-pack-name': pack,
+    'sticker-pack-publisher': author,
+    'emojis': metadata.categories || ['✨', '🤖']
+  });
+  const dataBuf = Buffer.from(data, 'utf-8');
+  const exifHeader = Buffer.from([
+    0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x41, 0x57, 0x07, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x16, 0x00, 0x00, 0x00
+  ]);
+  exifHeader.writeUIntLE(dataBuf.length, 14, 4);
+  return Buffer.concat([exifHeader, dataBuf]);
+}
+
+/**
+ * Inyecta metadatos EXIF en un WebP animado preservando y forzando hasAlpha = 1 (bit 4).
+ * Corrige el bug crítico donde Chromium/WhatsApp Web asume fondo opaco y dibuja bloques blancos.
+ */
+export function injectExifToAnimatedWebp(webpBuffer, metadata = {}) {
+  const exifPayload = buildExifPayload(metadata);
+  const exifChunkHeader = Buffer.from('EXIF');
+  const exifChunkLen = Buffer.alloc(4);
+  exifChunkLen.writeUInt32LE(exifPayload.length, 0);
+  const padByte = (exifPayload.length % 2 === 1) ? Buffer.from([0x00]) : Buffer.alloc(0);
+  const fullExifChunk = Buffer.concat([exifChunkHeader, exifChunkLen, exifPayload, padByte]);
+
+  const newBuffer = Buffer.from(webpBuffer);
+
+  if (newBuffer.toString('ascii', 12, 16) === 'VP8X') {
+    let flags = newBuffer.readUInt32LE(20);
+    flags = (flags | 0x08 | 0x10) >>> 0; // bit 3 = EXIF, bit 4 = Alpha transparente
+    newBuffer.writeUInt32LE(flags, 20);
+  }
+
+  const finalBuffer = Buffer.concat([newBuffer, fullExifChunk]);
+  finalBuffer.writeUInt32LE(finalBuffer.length - 8, 4); // Actualizar tamaño total en header RIFF
+  return finalBuffer;
+}
+
+/**
+ * Inyecta metadatos EXIF en un WebP estático asegurando soporte de alpha y metadatos limpios.
+ */
+export async function injectExifToStaticWebp(webpBuffer, metadata = {}) {
+  const exifPayload = buildExifPayload(metadata);
+  const img = new webpmux.Image();
+  await img.load(webpBuffer);
+  img.exif = exifPayload;
+  const saved = await img.save(null);
+
+  if (saved.toString('ascii', 12, 16) === 'VP8X') {
+    const buf = Buffer.from(saved);
+    let flags = buf.readUInt32LE(20);
+    flags = (flags | 0x10) >>> 0;
+    buf.writeUInt32LE(flags, 20);
+    return buf;
+  }
+  return saved;
+}
+
+/**
+ * Convierte un video o GIF directamente a WebP animado de 512x512 con transparencia real y 15 FPS.
+ * Elimina la conversión intermedia a GIF de 256 colores que corrompía los colores y producía artefactos.
+ */
+export async function convertAnimatedToWebp(inputBuffer, ext = 'mp4', quality = 55) {
   const tmpDir = os.tmpdir();
   const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const inputPath = path.join(tmpDir, `stk_${id}.mp4`);
-  const outputPath = path.join(tmpDir, `stk_${id}.webp`);
+  const inputPath = path.join(tmpDir, `input_${id}.${ext}`);
+  const outputPath = path.join(tmpDir, `output_${id}.webp`);
 
   fs.writeFileSync(inputPath, inputBuffer);
 
-  return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .outputOptions([
-        '-vcodec', 'libwebp',
-        '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,format=rgba,pad=512:512:(512-iw)/2:(512-ih)/2:color=#00000000,fps=15',
-        '-loop', '0',
-        '-lossless', '0',
-        '-qscale', String(Math.max(40, Math.min(80, quality))),
-        '-preset', 'default',
-        '-an',
-        '-vsync', '0'
-      ])
-      .toFormat('webp')
-      .save(outputPath)
-      .on('end', () => {
-        try {
-          const res = fs.readFileSync(outputPath);
-          try { fs.unlinkSync(inputPath); } catch (_) {}
-          try { fs.unlinkSync(outputPath); } catch (_) {}
-          resolve(res);
-        } catch (e) {
-          reject(e);
-        }
-      })
-      .on('error', (err) => {
-        try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (_) {}
-        try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
-        reject(err);
-      });
-  });
+  const runFfmpeg = (q, maxDuration = 6) =>
+    new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .inputOptions(['-t', String(maxDuration)])
+        .outputOptions([
+          '-vcodec', 'libwebp',
+          '-vf', 'fps=15,scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(512-iw)/2:(512-ih)/2:color=0x00000000',
+          '-lossless', '0',
+          '-q:v', String(q),
+          '-preset', 'default',
+          '-loop', '0',
+          '-an',
+          '-vsync', '0'
+        ])
+        .toFormat('webp')
+        .save(outputPath)
+        .on('end', () => {
+          try {
+            const res = fs.readFileSync(outputPath);
+            resolve(res);
+          } catch (e) {
+            reject(e);
+          }
+        })
+        .on('error', reject);
+    });
+
+  try {
+    let result = await runFfmpeg(quality, 6);
+    // Límite estricto de WhatsApp para stickers animados: 500 KB (512,000 bytes)
+    if (result.length > 480 * 1024) {
+      logger.info({ size: result.length }, 'Sticker > 480KB, optimizando compresión a 4 segundos...');
+      result = await runFfmpeg(Math.max(35, quality - 15), 4);
+    }
+    return result;
+  } finally {
+    try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch (_) {}
+    try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
+  }
+}
+
+/**
+ * Convierte una imagen estática a WebP 512x512 con proporción respetada y fondo transparente.
+ */
+export async function convertStaticToWebp(inputBuffer, quality = 75) {
+  return await sharp(inputBuffer)
+    .resize(512, 512, {
+      fit: 'contain',
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
+    })
+    .webp({ quality })
+    .toBuffer();
 }
 
 /**
@@ -114,39 +208,37 @@ export async function downloadMediaBuffer(url) {
 }
 
 /**
- * Convierte una imagen o sticker (estático o animado) a formato WebP compatible con WhatsApp (512x512).
+ * Convierte cualquier recurso (video, gif, webp animado o foto) a un sticker WebP de WhatsApp perfecto (512x512).
  * @param {string} mediaUrl 
  * @param {object} [customOptions] 
- * @returns {Promise<Buffer>} Buffer del sticker WebP final
+ * @returns {Promise<Buffer>} Buffer del sticker WebP final con EXIF y transparencia impecable
  */
 export async function createStickerFromUrl(mediaUrl, customOptions = {}) {
   try {
-    let buffer = await downloadMediaBuffer(mediaUrl);
+    const buffer = await downloadMediaBuffer(mediaUrl);
+    const type = detectBufferType(buffer);
+    const quality = customOptions.quality || STICKER_QUALITY || 55;
 
-    const type = customOptions.type || (STICKER_TYPE === 'cropped' ? StickerTypes.CROPPED : StickerTypes.FULL);
-    const quality = customOptions.quality || STICKER_QUALITY || 70;
+    logger.info({ mediaUrl: mediaUrl.slice(0, 80), detectedType: type, size: buffer.length }, 'Procesando sticker con nuevo motor de alta fidelidad');
 
-    // Si es un archivo de video, convertirlo con FFmpeg directamente a WebP
-    // para preservar colores puros de 24 bits y evitar corrupción de alpha
-    if (isVideoBuffer(buffer)) {
-      try {
-        buffer = await convertVideoToWebp(buffer, quality);
-      } catch (err) {
-        logger.warn({ err: err.message }, 'Fallo conversión directa a WebP con FFmpeg, usando fallback');
+    if (type === 'video' || type === 'gif') {
+      const ext = type === 'gif' ? 'gif' : 'mp4';
+      const webp = await convertAnimatedToWebp(buffer, ext, quality);
+      return injectExifToAnimatedWebp(webp, customOptions);
+    } else if (type === 'webp_anim') {
+      let webp = buffer;
+      // Si el WebP animado original excede el límite de WhatsApp de 500 KB, re-comprimirlo
+      if (buffer.length > 480 * 1024) {
+        webp = await convertAnimatedToWebp(buffer, 'webp', 45);
       }
+      return injectExifToAnimatedWebp(webp, customOptions);
+    } else {
+      // Estático (PNG, JPG, WebP estático, SVG)
+      const webp = await convertStaticToWebp(buffer, 75);
+      return await injectExifToStaticWebp(webp, customOptions);
     }
-
-    const sticker = new Sticker(buffer, {
-      pack: customOptions.pack || STICKER_PACK || 'Stoky Stickers',
-      author: customOptions.author || STICKER_AUTHOR || 'Stoky Bot',
-      type: type,
-      quality: quality,
-      categories: ['✨', '🤖']
-    });
-
-    return await sticker.toBuffer();
   } catch (error) {
-    logger.error({ error: error.message, mediaUrl }, 'Error al convertir recurso a WebP');
+    logger.error({ error: error.message, mediaUrl }, 'Error al generar sticker de WhatsApp');
     throw new Error(`Error en el procesamiento del sticker: ${error.message}`);
   }
 }
