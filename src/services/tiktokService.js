@@ -1,27 +1,37 @@
+import { trace, withTikTokTrace } from '../utils/tiktokTrace.js';
+import fs from 'node:fs';
+import { detectCommentMedia } from './commentMedia.js';
+export { detectCommentMedia } from './commentMedia.js';
 import axios from 'axios';
+import { catalogService } from './catalogService.js';
 import { RAPIDAPI_KEYS, RAPIDAPI_HOST, RAPIDAPI_ENDPOINT } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { cloudStore } from './cloudStore.js';
 
 // Pool de llaves para rotación automática y failover
 const keyPool = RAPIDAPI_KEYS.map((key, index) => ({
   index: index + 1,
   key,
   masked: key.slice(0, 6) + '...' + key.slice(-4),
-  limit: 50,
-  remaining: 50,
-  resetSeconds: 2600000,
+  limit: null,
+  remaining: null,
+  resetSeconds: null,
+  resetAt: null,
   isExhausted: false,
   lastUsed: 0
 }));
 
-// Valores iniciales conocidos de las cuentas en vivo (5 cuentas en rotación):
-if (keyPool[0]) keyPool[0].remaining = 8;
-if (keyPool[1]) keyPool[1].remaining = 49;
-if (keyPool[2]) keyPool[2].remaining = 49;
-if (keyPool[3]) keyPool[3].remaining = 49;
-if (keyPool[4]) keyPool[4].remaining = 49;
-
 let currentKeyIndex = 0;
+
+export function assertProviderSuccess(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('RAPIDAPI_INVALID_RESPONSE: El proveedor no devolvio un objeto JSON valido');
+  }
+  const code = data.status_code ?? data.code;
+  if (code !== undefined && Number(code) !== 0) {
+    throw new Error(`RAPIDAPI_PROVIDER_ERROR (${code}): ${data.status_msg || data.msg || data.message || 'El proveedor rechazo la consulta'}`);
+  }
+}
 
 /**
  * Formatea segundos restantes en días, horas y minutos legibles.
@@ -47,16 +57,17 @@ export function formatResetTime(seconds) {
  * Obtiene la llave actualmente activa, o busca la siguiente disponible no agotada.
  */
 function getActiveKey() {
+  for (const k of keyPool) if (k.resetAt && Date.now() >= k.resetAt) { k.isExhausted = false; k.remaining = null; k.resetAt = null; }
   if (keyPool.length === 0) return null;
 
-  if (!keyPool[currentKeyIndex].isExhausted && keyPool[currentKeyIndex].remaining > 0) {
+  if (!keyPool[currentKeyIndex].isExhausted && keyPool[currentKeyIndex].remaining !== 0) {
     return keyPool[currentKeyIndex];
   }
 
   for (let i = 0; i < keyPool.length; i++) {
     const candidateIdx = (currentKeyIndex + i) % keyPool.length;
     const candidate = keyPool[candidateIdx];
-    if (!candidate.isExhausted && candidate.remaining > 0) {
+    if (!candidate.isExhausted && candidate.remaining !== 0) {
       currentKeyIndex = candidateIdx;
       return candidate;
     }
@@ -71,12 +82,13 @@ function getActiveKey() {
 function rotateToNextKey(reason = '') {
   const prevIdx = currentKeyIndex;
   keyPool[prevIdx].isExhausted = true;
+  keyPool[prevIdx].resetAt ||= Date.now() + 60000;
   keyPool[prevIdx].remaining = 0;
 
   for (let i = 1; i <= keyPool.length; i++) {
     const nextIdx = (prevIdx + i) % keyPool.length;
     const next = keyPool[nextIdx];
-    if (!next.isExhausted && next.remaining > 0) {
+    if (!next.isExhausted && next.remaining !== 0) {
       currentKeyIndex = nextIdx;
       console.log(`\n[Stoky Quota] 🔄 ${reason}. Rotando automáticamente: Cuenta #${keyPool[prevIdx].index} -> Cuenta #${next.index} (${next.remaining} disponibles).\n`);
       return next;
@@ -103,15 +115,15 @@ function getShortestResetText() {
 function updateKeyQuotaFromHeaders(keyObj, headers) {
   if (!keyObj || !headers) return;
   const limit = headers['x-ratelimit-requests-limit'] || headers['x-ratelimit-scraping-api-limit'];
-  const remaining = headers['x-ratelimit-requests-remaining'] || headers['x-ratelimit-scraping-api-remaining'];
+  const remaining = headers['x-ratelimit-requests-remaining'] ?? headers['x-ratelimit-scraping-api-remaining'];
   const reset = headers['x-ratelimit-requests-reset'] || headers['x-ratelimit-scraping-api-reset'];
 
   if (limit) keyObj.limit = parseInt(limit, 10);
-  if (reset) keyObj.resetSeconds = parseInt(reset, 10);
+  if (reset) { keyObj.resetSeconds = parseInt(reset, 10); keyObj.resetAt = Date.now() + keyObj.resetSeconds * 1000; }
 
   if (remaining !== undefined) {
     keyObj.remaining = parseInt(remaining, 10);
-    if (keyObj.remaining <= 0) {
+    if (keyObj.remaining === 0) {
       keyObj.isExhausted = true;
     }
   }
@@ -140,6 +152,7 @@ export async function executeRapidApiRequest(params) {
     }
 
     try {
+      trace('api.request', { provider: RAPIDAPI_HOST, endpoint: RAPIDAPI_ENDPOINT, account: activeKey.index, attempt: attempts, params });
       const response = await axios.get(RAPIDAPI_ENDPOINT, {
         params,
         headers: {
@@ -149,9 +162,11 @@ export async function executeRapidApiRequest(params) {
         timeout: 15000
       });
 
+      trace('api.response', { status: response.status, code: response.data?.status_code ?? response.data?.code, message: response.data?.status_msg || response.data?.msg, fields: Object.keys(response.data || {}), dataFields: Object.keys(response.data?.data || {}), remaining: response.headers['x-ratelimit-requests-remaining'] });
       updateKeyQuotaFromHeaders(activeKey, response.headers);
+      assertProviderSuccess(response.data);
 
-      if (activeKey.remaining <= 0) {
+      if (activeKey.remaining === 0) {
         rotateToNextKey(`Cuenta #${activeKey.index} consumió su última petición (0 restantes)`);
       }
 
@@ -161,15 +176,16 @@ export async function executeRapidApiRequest(params) {
         updateKeyQuotaFromHeaders(activeKey, err.response.headers);
       }
 
+      trace('api.error', { account: activeKey.index, status: err.response?.status, message: err.message });
       const status = err.response?.status;
       const errorMsg = err.response?.data?.message || err.message || '';
 
+      trace('api.failure_classified', { status, providerMessage: errorMsg, transportCode: err.code });
       const isQuotaExceeded =
         status === 429 ||
         errorMsg.toLowerCase().includes('rate limit') ||
         errorMsg.toLowerCase().includes('quota') ||
-        errorMsg.toLowerCase().includes('exceeded') ||
-        activeKey.remaining <= 0;
+        activeKey.remaining === 0;
 
       if (isQuotaExceeded) {
         logger.warn(
@@ -210,8 +226,8 @@ export async function getQuotaStatus(forceFetch = false) {
   const totalLimit = keyPool.reduce((acc, k) => acc + k.limit, 0);
 
   return {
-    totalRemaining,
-    totalLimit,
+    totalRemaining: keyPool.some(k => k.remaining === null) ? "pendiente de consultar" : totalRemaining,
+    totalLimit: keyPool.some(k => k.limit === null) ? "desconocido" : totalLimit,
     activeKeyIndex: activeKey ? activeKey.index : null,
     totalKeys: keyPool.length,
     keys: keyPool.map((k) => ({
@@ -219,11 +235,11 @@ export async function getQuotaStatus(forceFetch = false) {
       masked: k.masked,
       remaining: k.remaining,
       limit: k.limit,
-      isExhausted: k.isExhausted || k.remaining <= 0,
+      isExhausted: k.isExhausted || k.remaining === 0,
       isActive: activeKey && activeKey.index === k.index,
-      resetText: formatResetTime(k.resetSeconds)
+      resetText: formatResetTime(k.resetAt ? Math.max(0, (k.resetAt - Date.now()) / 1000) : k.resetSeconds)
     })),
-    isExceeded: totalRemaining <= 0,
+    isExceeded: keyPool.length === 0 || keyPool.every(k => k.isExhausted),
     resetText: getShortestResetText()
   };
 }
@@ -247,7 +263,7 @@ export async function addDynamicApiKey(rawKey) {
   // Verificar en vivo contra RapidAPI / ScrapTik
   try {
     const testRes = await axios.get(RAPIDAPI_ENDPOINT, {
-      params: { aweme_id: '7697665394248600848', count: 1 },
+      params: { url: '7697665394248600848', aweme_id: '7697665394248600848', count: 1 },
       headers: {
         'x-rapidapi-key': cleanKey,
         'x-rapidapi-host': RAPIDAPI_HOST
@@ -255,9 +271,14 @@ export async function addDynamicApiKey(rawKey) {
       timeout: 10000
     });
 
-    const limit = parseInt(testRes.headers['x-ratelimit-requests-limit'] || '50', 10);
-    const remaining = parseInt(testRes.headers['x-ratelimit-requests-remaining'] || '50', 10);
-    const reset = parseInt(testRes.headers['x-ratelimit-requests-reset'] || '2600000', 10);
+    assertProviderSuccess(testRes.data);
+    const numberHeader = name => {
+      const value = Number.parseInt(testRes.headers[name], 10);
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    };
+    const limit = numberHeader('x-ratelimit-requests-limit');
+    const remaining = numberHeader('x-ratelimit-requests-remaining');
+    const reset = numberHeader('x-ratelimit-requests-reset');
 
     const newIndex = keyPool.length + 1;
     const newEntry = {
@@ -267,7 +288,8 @@ export async function addDynamicApiKey(rawKey) {
       limit,
       remaining,
       resetSeconds: reset,
-      isExhausted: remaining <= 0,
+      resetAt: reset === null ? null : Date.now() + reset * 1000,
+      isExhausted: remaining === 0,
       lastUsed: Date.now()
     };
 
@@ -275,24 +297,24 @@ export async function addDynamicApiKey(rawKey) {
 
     // Persistir en .env
     try {
+      if (cloudStore) {
+        await cloudStore.put('keys', keyPool.map(k => k.key));
+      } else {
       const fs = await import('fs');
       const envPath = '.env';
-      if (fs.existsSync(envPath)) {
-        let envContent = fs.readFileSync(envPath, 'utf-8');
-        const match = envContent.match(/RAPIDAPI_KEYS=([^\r\n]+)/);
-        if (match) {
-          const updatedKeys = `${match[1]},${cleanKey}`;
-          envContent = envContent.replace(match[0], `RAPIDAPI_KEYS=${updatedKeys}`);
-          fs.writeFileSync(envPath, envContent, 'utf-8');
-        }
+      let content = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+      const line = 'RAPIDAPI_KEYS=' + keyPool.map(k => k.key).join(',');
+      content = /^RAPIDAPI_KEYS=.*$/m.test(content) ? content.replace(/^RAPIDAPI_KEYS=.*$/m, line) : content + '\n' + line + '\n';
+      fs.writeFileSync(envPath + '.tmp', content, 'utf8');
+      fs.renameSync(envPath + '.tmp', envPath);
       }
     } catch (fsErr) {
-      console.error('[TiktokService] No se pudo escribir en .env:', fsErr.message);
+      return { success: false, message: "Clave activada solo en memoria; no se pudo guardar .env: " + fsErr.message };
     }
 
     return {
       success: true,
-      message: `Cuenta #${newIndex} conectada exitosamente (${remaining}/${limit} peticiones disponibles).`,
+      message: `Cuenta #${newIndex} conectada exitosamente (${remaining ?? 'desconocidas'}/${limit ?? 'desconocido'} peticiones disponibles).`,
       keyInfo: newEntry
     };
   } catch (err) {
@@ -318,6 +340,8 @@ export async function resolveFinalUrl(inputUrl) {
   while (hops < maxHops) {
     try {
       const response = await axios.get(currentUrl, {
+        timeout: 15000,
+        maxContentLength: 2 * 1024 * 1024,
         maxRedirects: 5,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
@@ -434,17 +458,17 @@ export function extractTikTokIds(resolvedUrl) {
  */
 export async function fetchTikTokCommentByCid(videoId, cid, originalResolvedUrl) {
   let cursor = 0;
-  const maxPages = 3;
+  const maxPages = Math.min(100, Math.max(1, Number(process.env.MAX_COMMENT_PAGES) || 10));
   let page = 0;
 
   while (page < maxPages) {
     page++;
-    logger.info({ videoId, cid, page, cursor }, 'Consultando comentarios en RapidAPI...');
+    logger.debug({ videoId, cid, page, cursor }, 'Consultando comentarios en RapidAPI...');
 
     const response = await executeRapidApiRequest({
       video_id: videoId,
       aweme_id: videoId,
-      url: originalResolvedUrl,
+      url: RAPIDAPI_HOST.includes("tiktok-scraper7") ? videoId : originalResolvedUrl,
       count: 50,
       cursor: cursor
     });
@@ -458,7 +482,9 @@ export async function fetchTikTokCommentByCid(videoId, cid, originalResolvedUrl)
       (Array.isArray(data?.data) ? data.data : []) ||
       [];
 
+    trace('comments.page', { videoId, cid, page, cursor, count: Array.isArray(comments) ? comments.length : null, withImages: Array.isArray(comments) ? comments.filter(c => c.images?.length || c.image_list?.length).length : 0, withStickers: Array.isArray(comments) ? comments.filter(c => c.sticker || c.cmt_sticker_struct || c.sticker_info).length : 0 });
     if (!Array.isArray(comments) || comments.length === 0) {
+      trace('comments.search_end', { reason: 'empty_page', page, videoId, cid, total: data?.total ?? data?.data?.total, filtered: data?.has_filtered_comments, folded: data?.has_fold_comment });
       break;
     }
 
@@ -483,14 +509,7 @@ export async function fetchTikTokCommentByCid(videoId, cid, originalResolvedUrl)
 
     if (foundComment) {
       logger.info({ cid, found: true, pagesUsed: page }, 'Comentario encontrado en RapidAPI');
-      console.log('\n[DEBUG_TIKTOK_COMMENT]:', JSON.stringify({
-        id: foundComment.id || foundComment.cid,
-        text: foundComment.text,
-        images: foundComment.images || foundComment.image_list,
-        cmt_sticker: foundComment.cmt_sticker_struct || foundComment.sticker,
-        pagesUsed: page,
-        keys: Object.keys(foundComment)
-      }, null, 2), '\n');
+      trace('comment.matched', { expectedCid: cid, expectedVideoId: videoId, fields: Object.keys(foundComment), comment: foundComment });
       return { comment: foundComment, pagesUsed: page };
     }
 
@@ -499,13 +518,14 @@ export async function fetchTikTokCommentByCid(videoId, cid, originalResolvedUrl)
     const nextCursor = data?.data?.cursor ?? data?.cursor;
 
     if (!hasMore || nextCursor === undefined || nextCursor === cursor) {
+      trace('comments.search_end', { reason: 'pagination_end', page, videoId, cid, hasMore, nextCursor, filtered: data?.has_filtered_comments, folded: data?.has_fold_comment });
       break;
     }
 
     cursor = nextCursor;
   }
 
-  throw new Error(`NOT_FOUND_IN_API: No se encontró el comentario (cid: ${cid}) en las primeras páginas del video.`);
+  throw new Error(`NOT_FOUND_IN_API: No se encontro el comentario (cid: ${cid}) en las primeras páginas del video.`);
 }
 
 /**
@@ -516,114 +536,18 @@ export async function fetchTikTokCommentByCid(videoId, cid, originalResolvedUrl)
  * @param {object} comment 
  * @returns {{ hasMedia: boolean, type: string, isAnimated: boolean, url: string | null, commentText: string }}
  */
-export function detectCommentMedia(comment) {
-  // 1. Fotos adjuntas en el comentario (images: string[] o image_list: object[])
-  const images = comment.images || comment.image_list || [];
-  if (Array.isArray(images) && images.length > 0) {
-    const firstImg = images[0];
-    let imageUrl = null;
-
-    if (typeof firstImg === 'string') {
-      imageUrl = firstImg;
-    } else if (typeof firstImg === 'object' && firstImg !== null) {
-      imageUrl =
-        firstImg.display_image?.url_list?.[0] ||
-        firstImg.origin_url_list?.[0] ||
-        firstImg.image_url?.url_list?.[0] ||
-        firstImg.url_list?.[0] ||
-        firstImg.download_url_list?.[0] ||
-        firstImg.url;
-    }
-
-    if (imageUrl) {
-      return {
-        hasMedia: true,
-        type: 'photo',
-        isAnimated: false,
-        url: imageUrl,
-        commentText: comment.text || ''
-      };
-    }
-  }
-
-  // 2. Sticker nativo de TikTok (cmt_sticker_struct, sticker, sticker_info o interaction_sticker)
-  const sticker =
-    comment.cmt_sticker_struct ||
-    comment.sticker ||
-    comment.sticker_info ||
-    comment.interaction_sticker ||
-    (Array.isArray(comment.stickers) ? comment.stickers[0] : null);
-
-  if (sticker) {
-    let animateUrl = null;
-    let staticUrl = null;
-
-    if (typeof sticker === 'string') {
-      staticUrl = sticker;
-    } else if (typeof sticker === 'object' && sticker !== null) {
-      // Formato móvil de TikTok (cmt_sticker_struct)
-      const anim = sticker.animated_url || sticker.animate_url;
-      if (anim) {
-        animateUrl =
-          anim.high_resolution_url?.url_list?.[0] ||
-          anim.mid_resolution_url?.url_list?.[0] ||
-          anim.low_resolution_url?.url_list?.[0] ||
-          anim.url_list?.[0] ||
-          anim.url;
-      }
-
-      const stat = sticker.static_url;
-      if (stat) {
-        staticUrl =
-          stat.high_resolution_url?.url_list?.[0] ||
-          stat.mid_resolution_url?.url_list?.[0] ||
-          stat.low_resolution_url?.url_list?.[0] ||
-          stat.url_list?.[0] ||
-          stat.url;
-      }
-    }
-
-    if (animateUrl) {
-      return {
-        hasMedia: true,
-        type: 'sticker_animated',
-        isAnimated: true,
-        url: animateUrl,
-        commentText: comment.text || ''
-      };
-    }
-
-    if (staticUrl) {
-      return {
-        hasMedia: true,
-        type: 'sticker_static',
-        isAnimated: false,
-        url: staticUrl,
-        commentText: comment.text || ''
-      };
-    }
-  }
-
-  // 3. Detección de sticker nativo integrado en texto (ej. [Sticker], [Laugh approved], etc.)
-  const isNativeStickerTag = /\[(sticker|emoji|[a-záéíóú0-9\s_-]+)\]/i.test(comment.text || '');
-
-  return {
-    hasMedia: false,
-    type: isNativeStickerTag ? 'native_sticker_tag' : 'text_only',
-    isAnimated: false,
-    url: null,
-    commentText: comment.text || ''
-  };
-}
-
 /**
  * Orquestador principal del servicio de TikTok.
  * Recibe un enlace compartido, resuelve la URL, extrae IDs, consulta la API y analiza el contenido.
  * @param {string} rawUrl 
  */
 export async function extractTikTokCommentMedia(rawUrl) {
+  return withTikTokTrace(rawUrl, () => extractMedia(rawUrl));
+}
+async function extractMedia(rawUrl) {
   const resolvedUrl = await resolveFinalUrl(rawUrl);
   const { videoId, cid } = extractTikTokIds(resolvedUrl);
+  trace('link.resolved', { resolvedUrl, videoId, cid });
 
   if (!videoId) {
     throw new Error('NO_VIDEO_ID: No se pudo extraer el ID del video de TikTok en la URL.');
@@ -633,8 +557,18 @@ export async function extractTikTokCommentMedia(rawUrl) {
     throw new Error('NO_CID: El enlace corresponde al video, pero no contiene el ID de ningún comentario. Asegúrate de copiar el enlace desde la opción "Compartir comentario".');
   }
 
+  const cached = catalogService.getByCid(cid);
+  if (cached) return { cachedBuffer: cached.buffer, cid, pagesUsed: 0, hasMedia: true };
   const { comment, pagesUsed } = await fetchTikTokCommentByCid(videoId, cid, resolvedUrl);
   const mediaResult = detectCommentMedia(comment);
+  trace('media.detected', { ...mediaResult, reason: mediaResult.hasMedia ? 'recognized_url' : 'no_supported_media_url', fields: Object.keys(comment) });
+  if (!mediaResult.hasMedia && process.env.TIKTOK_DEBUG === 'true') {
+    try {
+      fs.mkdirSync('scratch', { recursive: true });
+      const media = Object.fromEntries(Object.entries(comment).filter(([key]) => /image|sticker|media|attach/i.test(key)));
+      fs.writeFileSync('scratch/last-comment-media.json', JSON.stringify({ provider: RAPIDAPI_HOST, videoId, cid, fields: Object.keys(comment), text: comment.text, media }, null, 2));
+    } catch (err) { logger.warn({ message: err.message }, 'No se pudo guardar diagnostico multimedia'); }
+  }
 
   return {
     videoId,

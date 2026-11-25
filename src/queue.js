@@ -16,10 +16,12 @@ class MessageQueue {
    * Añade una función asíncrona a la cola de ejecución.
    * @param {() => Promise<void>} taskFn 
    */
-  enqueue(taskFn) {
+  enqueue(taskFn, user = "local") {
+    if (this.queue.length >= 50 || this.queue.filter(t => t.user === user).length >= 3) return Promise.reject(new Error("Limite de solicitudes pendientes"));
     return new Promise((resolve, reject) => {
       this.queue.push({
         taskFn,
+        user,
         resolve,
         reject
       });

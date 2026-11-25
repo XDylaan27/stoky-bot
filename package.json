@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "start:cloud": "node src/cloud.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/*.test.cjs"
   },
   "keywords": [
     "whatsapp",
@@ -25,5 +27,8 @@
     "node-webpmux": "^3.2.1",
     "pino": "^10.4.0",
     "qrcode-terminal": "^0.12.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

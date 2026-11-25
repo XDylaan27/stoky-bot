@@ -1,12 +1,14 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 
 const DATA_DIR = path.resolve('data');
 const STATE_FILE = path.join(DATA_DIR, 'bot_state.json');
 
 // Estado inicial por defecto
 const DEFAULT_STATE = {
-  isPrivate: false,
+  isPrivate: true,
+  pausedChats: [],
   adminJids: [], // Admins identificados
   whitelist: [], // Números/JIDs autorizados
   pendingInvites: {}, // { [code]: { createdAt, used: false, usedBy: null } }
@@ -29,12 +31,12 @@ class StateService {
       }
       if (fs.existsSync(STATE_FILE)) {
         const raw = fs.readFileSync(STATE_FILE, 'utf-8');
-        return { ...DEFAULT_STATE, ...JSON.parse(raw) };
+        return { ...structuredClone(DEFAULT_STATE), ...JSON.parse(raw) };
       }
     } catch (err) {
       console.error('[StateService] Error al cargar estado, usando default:', err.message);
     }
-    const state = { ...DEFAULT_STATE };
+    const state = structuredClone(DEFAULT_STATE);
     this.saveState(state);
     return state;
   }
@@ -44,10 +46,18 @@ class StateService {
       if (!fs.existsSync(DATA_DIR)) {
         fs.mkdirSync(DATA_DIR, { recursive: true });
       }
-      fs.writeFileSync(STATE_FILE, JSON.stringify(stateToSave, null, 2), 'utf-8');
+      fs.writeFileSync(STATE_FILE + '.tmp', JSON.stringify(stateToSave, null, 2), 'utf-8');
+      fs.renameSync(STATE_FILE + '.tmp', STATE_FILE);
     } catch (err) {
       console.error('[StateService] Error al guardar estado:', err.message);
     }
+  }
+
+  isPaused(jid) { return this.state.pausedChats.includes(jid); }
+  setPaused(jid, paused) {
+    this.state.pausedChats = this.state.pausedChats.filter(x => x !== jid);
+    if (paused) this.state.pausedChats.push(jid);
+    this.saveState();
   }
 
   // Comprobar si el modo privado está activo
@@ -76,7 +86,7 @@ class StateService {
     for (let i = 0; i < 4; i++) {
       randomPart += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-    const code = `STK-${randomPart}`;
+    const code = `STK-${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
 
     this.state.pendingInvites[code] = {
       code,
@@ -123,7 +133,7 @@ class StateService {
 
     this.state.whitelist = this.state.whitelist.filter((j) => {
       const phone = j.split('@')[0];
-      return j !== clean && phone !== clean && !j.startsWith(clean);
+      return j !== clean && phone !== clean;
     });
 
     const removed = this.state.whitelist.length < beforeCount;

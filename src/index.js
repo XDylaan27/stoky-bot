@@ -20,12 +20,16 @@ import { humanDelay } from './utils/delay.js';
 import { logger } from './utils/logger.js';
 import { messageQueue } from './queue.js';
 import { extractTikTokCommentMedia, getQuotaStatus, addDynamicApiKey } from './services/tiktokService.js';
-import { createStickerFromUrl } from './services/stickerService.js';
+import { createStickerFromUrl, buildStickerMessage } from './services/stickerService.js';
 import { stateService } from './services/stateService.js';
 import { catalogService } from './services/catalogService.js';
+import { isAuthorizedSender } from './services/accessService.js';
+import { cloudStore } from './services/cloudStore.js';
+import { useCloudAuth } from './services/cloudAuth.js';
 
 // Logger que escribe simultáneamente en consola y en bot.log
 function logConsole(...args) {
+  if (process.env.TIKTOK_DEBUG !== 'true' && !args.some(arg => String(arg).includes('[Stoky Error]'))) return;
   const line = `[${new Date().toLocaleTimeString()}] ${args.map(a => (typeof a === 'object' ? JSON.stringify(a) : a)).join(' ')}`;
   console.log(line);
   try {
@@ -35,6 +39,9 @@ function logConsole(...args) {
 
 // Conjunto de chats activos (usuarios que enviaron "iniciar-bot" o enviaron un enlace)
 const activeChats = new Set();
+// Keep the selected login method across automatic reconnections.
+let forceQrLogin = process.argv.includes('--qr');
+const seenMessages = new Set();
 
 /**
  * Extrae el texto real del mensaje, soportando mensajes temporales (ephemeral) y multimedia.
@@ -65,6 +72,7 @@ function extractMessageBody(msg) {
  * Procesa un enlace individual de TikTok aplicando simulación de comportamiento humano y rate-limiting.
  */
 async function handleTikTokMessage(sock, msg, rawUrl, remoteJid) {
+  if (stateService.isPaused(remoteJid)) return;
   try {
     logConsole(`[Stoky] Iniciando proceso para ${remoteJid} con URL: ${rawUrl}`);
 
@@ -93,7 +101,7 @@ async function handleTikTokMessage(sock, msg, rawUrl, remoteJid) {
         logConsole(`[Stoky] ⚡ Sticker encontrado en Catálogo Local (${cached.code}). Enviando sin consultar API de TikTok...`);
         await sock.sendMessage(
           remoteJid,
-          { sticker: cached.buffer },
+          buildStickerMessage(cached.buffer),
           { quoted: msg }
         );
         await sock.sendMessage(remoteJid, {
@@ -112,7 +120,9 @@ async function handleTikTokMessage(sock, msg, rawUrl, remoteJid) {
 
     // Caso 1: Comentario sin imagen ni sticker (solo texto)
     if (!result.hasMedia) {
-      let warningText = '⚠️ *Stoky:* Ese comentario solo tiene texto, no contiene ningún sticker ni foto.';
+      let warningText = result.type === 'unsupported_media'
+        ? 'Stoky: el comentario contiene multimedia, pero no pude obtener un archivo compatible.'
+        : 'Stoky: encontre el comentario, pero no recibi ningun archivo multimedia descargable.';
       if (result.type === 'native_sticker_tag') {
         warningText = `⚠️ *Stoky:* Este comentario usa un emoji o sticker del catálogo nativo de TikTok (${result.commentText}).\n\nTikTok no proporciona el archivo de imagen de sus stickers internos en su API pública. ¡Pero sí convierte cualquier *foto, meme o sticker personalizado* que suban los usuarios!`;
       }
@@ -132,7 +142,9 @@ async function handleTikTokMessage(sock, msg, rawUrl, remoteJid) {
 
     // Caso 2: Comentario con imagen o sticker nativo (mantiene silueta y transparencia)
     logConsole(`[Stoky] Convirtiendo recurso a sticker WebP 512x512...`);
-    const stickerBuffer = await createStickerFromUrl(result.url);
+    const stickerBuffer = result.cachedBuffer || await createStickerFromUrl(result.urls?.length ? result.urls : result.url);
+
+    if (!Buffer.isBuffer(stickerBuffer) || !stickerBuffer.length) throw new Error("La conversion no produjo un archivo de sticker valido");
 
     // Guardar en el catálogo local para futuras consultas con 0 peticiones
     const savedInCatalog = catalogService.saveSticker(result.cid, stickerBuffer, result.commentText);
@@ -141,7 +153,7 @@ async function handleTikTokMessage(sock, msg, rawUrl, remoteJid) {
     // Enviar sticker generado
     await sock.sendMessage(
       remoteJid,
-      { sticker: stickerBuffer },
+      buildStickerMessage(stickerBuffer),
       { quoted: msg }
     );
 
@@ -151,9 +163,9 @@ async function handleTikTokMessage(sock, msg, rawUrl, remoteJid) {
     });
 
     // Registrar en historial de métricas
-    stateService.recordStickerUsage(remoteJid, rawUrl, result.pagesUsed || 1, result.cid);
+    stateService.recordStickerUsage(remoteJid, rawUrl, result.pagesUsed ?? 1, result.cid);
 
-    logConsole(`[Stoky] ✅ Sticker enviado exitosamente a ${remoteJid}${codeTag} (Páginas usadas: ${result.pagesUsed || 1})`);
+    logConsole(`[Stoky] ✅ Sticker enviado exitosamente a ${remoteJid}${codeTag} (Páginas usadas: ${result.pagesUsed ?? 1})`);
   } catch (error) {
     logConsole(`[Stoky Error]: ${error.message}`);
 
@@ -170,7 +182,7 @@ async function handleTikTokMessage(sock, msg, rawUrl, remoteJid) {
     } else if (error.message.includes('RAPIDAPI_KEY_MISSING')) {
       replyMessage = '⚙️ *Stoky:* Falta configurar `RAPIDAPI_KEY` en el archivo `.env`.';
     } else if (error.message.includes('NOT_FOUND_IN_API')) {
-      replyMessage = '⚠️ *Stoky:* No se encontró el comentario con ese ID en la API de TikTok. Podría haber sido eliminado recientemente o ser muy antiguo.';
+      replyMessage = 'Stoky: el proveedor no devolvio ese comentario en las paginas consultadas. Puede estar entre respuestas o comentarios filtrados. Esto no confirma que haya sido eliminado.';
     } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
       replyMessage = '⚠️ *Stoky:* La conexión con los servidores de TikTok tardó demasiado. Por favor, intenta de nuevo en unos segundos.';
     }
@@ -196,6 +208,7 @@ async function handleTikTokMessage(sock, msg, rawUrl, remoteJid) {
  * Función principal de arranque del Socket de Baileys
  */
 async function startBot() {
+  await catalogService.initialize();
   const configStatus = validateConfig();
   if (!configStatus.isValid) {
     console.warn('\n⚠️ [ADVERTENCIA DE CONFIGURACIÓN] Faltan variables en tu archivo .env:');
@@ -204,7 +217,9 @@ async function startBot() {
   }
 
   // 1. Cargar estado de sesión persistente en auth_info_baileys
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info_baileys');
+  const auth = cloudStore ? await useCloudAuth(cloudStore) : await useMultiFileAuthState('./auth_info_baileys');
+  const { state, saveCreds } = auth;
+  globalThis.stokyAuth = auth;
 
   // 2. Obtener la última versión oficial de WhatsApp Web según Baileys
   const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -222,17 +237,58 @@ async function startBot() {
     generateHighQualityLinkPreview: true
   });
 
+  const originalSend = sock.sendMessage.bind(sock);
+  globalThis.stokySocket = sock;
+  let sendChain = Promise.resolve();
+  let pendingSends = 0;
+  sock.sendMessage = (...args) => {
+    if (pendingSends >= 100) return Promise.reject(new Error("Cola de envios llena"));
+    pendingSends++;
+    const task = sendChain.then(async () => {
+      await sock.sendPresenceUpdate('composing', args[0]).catch(() => {});
+      await humanDelay(1500, 3000);
+      try { return await originalSend(...args); }
+      finally { await sock.sendPresenceUpdate('paused', args[0]).catch(() => {}); }
+    });
+    sendChain = task.catch(() => {}).finally(() => { pendingSends--; });
+    return task;
+  };
+
   // Escuchar actualización de credenciales para persistir la sesión
   sock.ev.on('creds.update', saveCreds);
 
   // Soporte para vinculación mediante Código de Emparejamiento (si se define PAIRING_NUMBER o --pairing)
-  const usePairing = Boolean(process.env.PAIRING_NUMBER || process.argv.includes('--pairing'));
+  const usePairing = !forceQrLogin && Boolean(process.env.PAIRING_NUMBER || process.argv.includes('--pairing'));
   const pairingNumber = (process.env.PAIRING_NUMBER || '').trim().replace(/[^0-9]/g, '');
+  let pairingTimer;
+  let loginPrompt;
+  let switchingToQr = false;
+
+  if (!sock.authState.creds.registered && process.stdin.isTTY) {
+    loginPrompt = readline.createInterface({ input: process.stdin, output: process.stdout });
+    console.log('\nPara vincular con QR, escribe q y presiona Enter.');
+    loginPrompt.on('line', (line) => {
+      if (line.trim().toLowerCase() !== 'q' || switchingToQr) return;
+      if (sock.authState.creds.registered) return;
+      if (!usePairing) {
+        console.log('El modo QR ya esta activo. Escanea el ultimo QR mostrado.');
+        return;
+      }
+      switchingToQr = true;
+      forceQrLogin = true;
+      clearTimeout(pairingTimer);
+      loginPrompt.close();
+      console.log('\nCambiando a QR. Espera a que aparezca el nuevo codigo...');
+      sock.end(new Error('Cambio de vinculacion a QR solicitado desde la terminal'));
+    });
+  }
 
   if (!sock.authState.creds.registered && usePairing && pairingNumber) {
-    setTimeout(async () => {
+    pairingTimer = setTimeout(async () => {
+      if (switchingToQr || sock.authState.creds.registered) return;
       try {
         const code = await sock.requestPairingCode(pairingNumber);
+        if (switchingToQr) return;
         const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
         console.log('\n╔══════════════════════════════════════════════════════════╗');
         console.log(`║  🔑 CÓDIGO DE VINCULACIÓN:  ${formattedCode.padEnd(27)} ║`);
@@ -253,8 +309,15 @@ async function startBot() {
   // Escuchar estado de conexión y código QR
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
+    if (globalThis.stokyStopping) return;
+    if (globalThis.stokyStatus && connection) globalThis.stokyStatus.whatsapp = connection;
 
-    if (qr && !usePairing) {
+    if (qr && !usePairing && !switchingToQr) {
+      if (cloudStore) {
+        globalThis.stokyStatus.whatsapp = 'needs_pairing';
+        console.error('[Cloud] WhatsApp requiere una nueva vinculacion');
+        return;
+      }
       console.log('\n======================================================');
       console.log('📱 ESCANEA ESTE CÓDIGO QR CON TU WHATSAPP');
       console.log('WhatsApp > Dispositivos vinculados > Vincular un dispositivo');
@@ -263,6 +326,8 @@ async function startBot() {
     }
 
     if (connection === 'close') {
+      clearTimeout(pairingTimer);
+      loginPrompt?.close();
       const statusCode = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -270,11 +335,13 @@ async function startBot() {
 
       if (shouldReconnect) {
         console.log('🔄 Reconectando en 3 segundos...');
-        setTimeout(() => startBot(), 3000);
+        setTimeout(() => startBot().catch(error => logger.error({ error: error.message }, "Error al reconectar")), 3000);
       } else {
         console.error('❌ Sesión finalizada (Logged Out). Elimina la carpeta "auth_info_baileys" y reinicia para generar un nuevo QR.');
       }
     } else if (connection === 'open') {
+      clearTimeout(pairingTimer);
+      loginPrompt?.close();
       console.log('\n======================================================');
       console.log('🚀 [BOT STOKY ACTIVO Y CONECTADO A WHATSAPP]');
       if (PUBLIC_MODE) {
@@ -288,12 +355,17 @@ async function startBot() {
 
   // Escuchar mensajes entrantes
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify' && type !== 'append') return;
+    if (type !== 'notify') return;
 
+    try {
     for (const msg of messages) {
       if (!msg.message) continue;
 
       const remoteJid = msg.key.remoteJid;
+      const messageId = `${remoteJid}:${msg.key.id}`;
+      if (seenMessages.has(messageId)) continue;
+      seenMessages.add(messageId);
+      if (seenMessages.size > 5000) seenMessages.delete(seenMessages.values().next().value);
 
       // 1. Regla Anti-Ban: Ignorar completamente grupos y estados
       if (!remoteJid || remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast') {
@@ -302,14 +374,15 @@ async function startBot() {
 
       // 2. Control de Acceso y Modo Privado
       const isFromMe = Boolean(msg.key.fromMe);
-      const isStaticAllowed = ALLOWED_JIDS.some((jid) => remoteJid === jid);
-      const isAllowed = isFromMe || isStaticAllowed || stateService.isUserAllowed(remoteJid, isFromMe);
+      const isAllowed = !stateService.isPrivateMode() || await isAuthorizedSender(
+        sock, msg.key, [...ALLOWED_JIDS, ...stateService.state.whitelist]
+      );
 
       // 3. Extraer texto del mensaje (soporta mensajes normales, temporales, con vista única o multimedia)
       const body = extractMessageBody(msg);
       if (!body) continue;
 
-      logConsole(`[Mensaje Recibido de ${remoteJid}]: "${body}"`);
+      logConsole(`[Mensaje Recibido de ${remoteJid}]: "${body.replace(/(stoky\s+(?:newkey|key)\s+)\S+/gi, "$1[OCULTA]")}"`);
 
       const cleanText = body.trim();
       const lowerText = cleanText.toLowerCase();
@@ -345,10 +418,19 @@ async function startBot() {
 
       // Si está en Modo Privado y el usuario NO está autorizado, ignorar completamente en silencio
       if (stateService.isPrivateMode() && !isAllowed) {
+        logger.info({ remoteJid }, 'Mensaje ignorado: remitente no autorizado o identidad LID sin resolver');
         continue;
       }
 
       // 4. Manejo de Comandos
+      if (lowerText === 'stoky admin') {
+        await sock.sendMessage(remoteJid, {
+          text: isFromMe
+            ? 'Stoky: esta cuenta es administradora. Puedes usar stoky newkey, stoky invite y los demas comandos de administracion.'
+            : 'Stoky: puedes usar el bot, pero esta cuenta no es administradora. Los comandos de administracion se envian desde la cuenta de WhatsApp vinculada al bot.'
+        }, { quoted: msg });
+        continue;
+      }
 
       // 4.1 Menú de Ayuda (stoky -h / stoky ayuda)
       if (lowerText === 'stoky -h' || lowerText === 'stoky ayuda' || lowerText === '!help' || lowerText === 'stoky help') {
@@ -497,7 +579,7 @@ async function startBot() {
         const catalogMsg =
           `📖 *Catálogo Web de Stickers Stoky:*\n\n` +
           `Puedes ver todos los stickers con vista previa animada y agregarlos a tu carrito en:\n` +
-          `🌐 *https://portafoliowebdylan.vercel.app/lab/stoky-catalogo*\n\n` +
+          `🌐 *${process.env.CATALOG_URL || "https://dylaan.dev/lab/stoky-catalogo"}*\n\n` +
           `• 📦 *Stickers disponibles:* ${total}\n\n` +
           `*¿Cómo pedir?*\n` +
           `1. Entra a la web, agrega los stickers que te gusten a tu carrito y presiona *"Pedir Carrito a Stoky"*.\n` +
@@ -520,7 +602,7 @@ async function startBot() {
 
         if (item && item.buffer) {
           await sock.sendMessage(remoteJid, { react: { text: '⏳', key: msg.key } });
-          await sock.sendMessage(remoteJid, { sticker: item.buffer }, { quoted: msg });
+          await sock.sendMessage(remoteJid, buildStickerMessage(item.buffer), { quoted: msg });
           await sock.sendMessage(remoteJid, { react: { text: '✅', key: msg.key } });
           stateService.recordStickerUsage(remoteJid, `catalog://${item.code}`, 0, item.cid);
           logConsole(`[Stoky] ✅ Sticker individual ${item.code} entregado desde catálogo.`);
@@ -559,7 +641,7 @@ async function startBot() {
         for (const code of batchCodes) {
           const item = catalogService.getByCode(code);
           if (item && item.buffer) {
-            await sock.sendMessage(remoteJid, { sticker: item.buffer });
+            await sock.sendMessage(remoteJid, buildStickerMessage(item.buffer));
             sentCount++;
             stateService.recordStickerUsage(remoteJid, `catalog://${item.code}`, 0, item.cid);
             // Delay de 1.2 a 1.8 segundos entre cada sticker del lote
@@ -598,6 +680,7 @@ async function startBot() {
 
       if (cleanText === 'pausar-bot' || cleanText === 'stoky off' || cleanText === '!stoky off') {
         activeChats.delete(remoteJid);
+        stateService.setPaused(remoteJid, true);
         await humanDelay(500, 1000);
         await sock.readMessages([msg.key]);
         await sock.sendMessage(
@@ -611,7 +694,7 @@ async function startBot() {
       if (cleanText === 'stoky estado' || cleanText === 'stoky status' || cleanText === 'stoky') {
         await humanDelay(400, 800);
         await sock.readMessages([msg.key]);
-        const isCurrentActive = isFromMe || activeChats.has(remoteJid);
+        const isCurrentActive = !stateService.isPaused(remoteJid) && (isFromMe || activeChats.has(remoteJid));
         const statusMsg = isCurrentActive
           ? '🟢 *Stoky está ACTIVO para ti.* Mándame enlaces de comentarios de TikTok.\n\n• Para pausarme: *pausar-bot*\n• Para ver tu cuota: *stoky-quota*'
           : '🔴 *Stoky está en REPOSO.* Escribe *iniciar-bot* para comenzar a crear stickers.\n\n• Para ver tu cuota: *stoky-quota*';
@@ -645,7 +728,7 @@ async function startBot() {
 
         const quotaMsg =
           `📊 *Estado de Cuota de Stoky (Multi-Cuenta):*\n\n` +
-          `• 🎟️ *Total disponible:* ${quota.totalRemaining} stickers de ${quota.totalLimit}\n` +
+          `• 🎟️ *Total disponible:* ${quota.totalRemaining} peticiones de ${quota.totalLimit}\n` +
           `• 🔄 *Cuentas conectadas:* ${quota.totalKeys} cuentas en rotación automática\n` +
           `• 📈 *Estado:* ${statusIcon}\n\n` +
           `*Detalle por cuenta:*\n${keysDetail}\n` +
@@ -663,21 +746,23 @@ async function startBot() {
         .filter(Boolean);
 
       if (urlsFound.length > 0) {
+        if (stateService.isPaused(remoteJid)) continue;
         logConsole(`[Stoky] Enlace de TikTok detectado de ${remoteJid}:`, urlsFound);
         // Si el usuario envió un enlace de TikTok, activamos automáticamente el chat
         activeChats.add(remoteJid);
 
         for (const tiktokUrl of urlsFound) {
-          messageQueue.enqueue(() => handleTikTokMessage(sock, msg, tiktokUrl, remoteJid));
+          messageQueue.enqueue(() => handleTikTokMessage(sock, msg, tiktokUrl, remoteJid), remoteJid).catch(error => logger.warn({ error: error.message }, "Peticion descartada"));
         }
         continue;
       }
 
       // 7. Encolar las peticiones en la cola secuencial con rate limiting / cooldown
       for (const tiktokUrl of urlsFound) {
-        messageQueue.enqueue(() => handleTikTokMessage(sock, msg, tiktokUrl, remoteJid));
+        messageQueue.enqueue(() => handleTikTokMessage(sock, msg, tiktokUrl, remoteJid), remoteJid).catch(error => logger.warn({ error: error.message }, "Peticion descartada"));
       }
     }
+    } catch (error) { logger.error({ error: error.message }, "Error procesando mensaje"); }
   });
 }
 
