@@ -1,5 +1,19 @@
 # Stoky Bot
 
+## Render
+
+Servicio gratuito: https://stoky-bot.onrender.com/health. Arranque remoto: npm run start:cloud; Node.js 24. Los despliegues son manuales para evitar reinicios inesperados al subir cambios.
+
+La sesion completa de Baileys se guarda cifrada con AES-256-GCM en Supabase a traves de una funcion privada, junto con las llaves dinamicas y el estado del bot. STOKY_STATE_URL, STOKY_STATE_TOKEN y STOKY_STATE_KEY se configuran exclusivamente como secretos del servidor. No subir .env.cloud.local ni auth_info_baileys. Perder la clave de cifrado impide recuperar la sesion.
+
+Un bloqueo de 90 segundos, renovado cada 20 segundos, evita conexiones simultaneas entre despliegues. La nueva instancia espera mientras la anterior libera la sesion. Las claves de autenticacion se guardan en cada actualizacion; preferencias e historial se guardan cada 20 segundos y al cerrar ordenadamente. Una caida abrupta puede perder hasta ese intervalo de preferencias, no implica que deba generarse un QR nuevo.
+
+Supabase Cron consulta /health cada cinco minutos (job stoky-render-health). No consume RapidAPI. El endpoint informa whatsapp=open cuando la conexion esta lista. Render gratuito puede reiniciar o suspender el servicio por limites; el monitor no garantiza disponibilidad absoluta. Una sesion revocada por WhatsApp requiere volver a vincular.
+
+Mientras Render este conectado, no ejecutar npm start en el portatil con la copia antigua de la misma sesion. Antes de volver al equipo local, detener Render y recuperar la version mas reciente de la sesion. El bloqueo remoto no protege ejecuciones locales con archivos antiguos.
+
+TIKTOK_DEBUG=false desactiva las trazas de conversion y las muestras de diagnostico. Se conservan errores y avisos operativos.
+
 Bot de WhatsApp que convierte multimedia de comentarios de TikTok a stickers WebP. Usa Baileys, ScrapTik/RapidAPI, FFmpeg y node-webpmux.
 
 ## Arranque
@@ -51,3 +65,4 @@ Con TIKTOK_DEBUG=true se registran la descarga, formato real, comando FFmpeg y r
 ## Formatos de fotos de ScrapTik
 
 Las fotos pueden llegar en image_list con origin_url o crop_url. El detector conserva las URLs alternativas de la misma imagen, prefiere las versiones JPEG/PNG/WebP explicitas y usa otro servidor/formato si falla la descarga o conversion (maximo seis intentos sin repetir la consulta RapidAPI). Los stickers animados conservan sus URLs animadas; no se sustituyen silenciosamente por otro comentario ni por una imagen estatica. La respuesta real que expuso este caso esta en test/fixtures/scraptik-photo-comment.json, con firmas y hosts reemplazados.
+
